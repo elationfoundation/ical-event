@@ -1,0 +1,275 @@
+;;; mail-calendar-org.el --- store iCalendar events as org-mode entries
+
+;; Copyright (C) 2013  Jan Tatarik
+;; Copyright (C) 2015  seamus tuohy
+
+;; Author: Jan Tatarik <Jan.Tatarik@gmail.com>
+;; Author: seamus tuohy <s2e@seamustuohy.com>
+;; Keywords: mail, icalendar, org
+
+;; This program is free software; you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;;
+
+;;; Code:
+
+(require 'org)
+(require 'org-capture)
+(require 'ical-event)
+
+
+(defgroup mail-calendar-org nil
+  "Settings for Calendar Event mail/org integration."
+  :group 'mail-calendar
+  :prefix "mail-calendar-org-")
+
+(defcustom mail-calendar-org-capture-file nil
+  "Target Org file for storing captured calendar events."
+  :type 'file
+  :group 'mail-calendar-org)
+
+(defcustom mail-calendar-org-capture-headline nil
+  "Target outline in `mail-calendar-org-capture-file' for storing captured events."
+  :type '(repeat string)
+  :group 'mail-calendar-org)
+
+(defcustom mail-calendar-org-template-name "used by mail-calendar-org"
+  "Org-mode template name."
+  :type '(string)
+  :group 'mail-calendar-org)
+
+(defcustom mail-calendar-org-template-key "#"
+  "Org-mode template hotkey."
+  :type '(string)
+  :group 'mail-calendar-org)
+
+(defvar mail-calendar-org-enabled-p nil)
+
+
+(defmethod ical-event:org-repeat ((event ical-event))
+  "Return `org-mode' timestamp repeater string for recurring EVENT.
+Return nil for non-recurring EVENT."
+  (when (ical-event:recurring-p event)
+    (let* ((freq-map '(("HOURLY" . "h")
+                       ("DAILY" . "d")
+                       ("WEEKLY" . "w")
+                       ("MONTHLY" . "m")
+                       ("YEARLY" . "y")))
+           (org-freq (cdr (assoc (ical-event:recurring-freq event) freq-map))))
+
+      (when org-freq
+        (format "+%s%s" (ical-event:recurring-interval event) org-freq)))))
+
+(defmethod ical-event:org-timestamp ((event ical-event))
+  "Build `org-mode' timestamp from EVENT start/end dates and recurrence info."
+  (let* ((start (ical-event:start-time event))
+         (end (ical-event:end-time event))
+         (start-date (format-time-string "%Y-%m-%d %a" start t))
+         (start-time (format-time-string "%H:%M" start t))
+         (end-date (format-time-string "%Y-%m-%d %a" end t))
+         (end-time (format-time-string "%H:%M" end t))
+         (org-repeat (ical-event:org-repeat event))
+         (repeat (if org-repeat (concat " " org-repeat) "")))
+
+    (if (equal start-date end-date)
+        (format "<%s %s-%s%s>" start-date start-time end-time repeat)
+      (format "<%s %s>--<%s %s>" start-date start-time end-date end-time))))
+
+;; TODO: make the template customizable
+(defmethod ical-event->org-entry ((event ical-event) reply-status)
+  "Return string with new `org-mode' entry describing EVENT."
+  (with-temp-buffer
+    (org-mode)
+    (with-slots (organizer summary description location
+                           recur uid) event
+      (let* ((reply (if reply-status (capitalize (symbol-name reply-status))
+                      "Not replied yet"))
+             (props `(("ICAL_EVENT" . "t")
+                      ("ID" . ,uid)
+                      ("DT" . ,(ical-event:org-timestamp event))
+                      ("ORGANIZER" . ,(ical-event:organizer event))
+                      ("LOCATION" . ,(ical-event:location event))
+                      ("RRULE" . ,(ical-event:recur event))
+                      ("REPLY" . ,reply))))
+
+        (insert (format "* %s (%s)\n\n" summary location))
+        (mapc (lambda (prop)
+                (org-entry-put (point) (car prop) (cdr prop)))
+              props))
+
+      (when description
+        (save-restriction
+          (narrow-to-region (point) (point))
+          (insert description)
+          (indent-region (point-min) (point-max) 2)
+          (fill-region (point-min) (point-max))))
+
+      (buffer-string))))
+
+(defun mail-calendar--deactivate-org-timestamp (ts)
+  (replace-regexp-in-string "[<>]"
+                            (lambda (m) (pcase m ("<" "[") (">" "]")))
+                            ts))
+
+(defun mail-calendar--show-org-event (event org-file)
+  (let (event-pos)
+    (with-current-buffer (find-file-noselect org-file)
+      (setq event-pos (org-find-entry-with-id (ical-event:uid event))))
+    (when event-pos
+      (switch-to-buffer (find-file org-file))
+      (goto-char event-pos)
+      (org-show-entry))))
+
+(defun mail-calendar--update-org-event (event org-file reply-status)
+  (with-current-buffer (find-file-noselect org-file)
+    (with-slots (uid summary description organizer location recur) event
+      (let ((event-pos (org-find-entry-with-id uid)))
+        (when event-pos
+          (goto-char event-pos)
+
+          ;; update the headline, keep todo, priority and tags, if any
+          (save-excursion
+            (let* ((priority (org-entry-get (point) "PRIORITY"))
+                   (headline (delq nil (list
+                                        (org-entry-get (point) "TODO")
+                                        (when priority (format "[#%s]" priority))
+                                        (format "%s (%s)" summary location)
+                                        (org-entry-get (point) "TAGS")))))
+
+              (re-search-forward "^\\*+ " (line-end-position))
+              (delete-region (point) (line-end-position))
+              (insert (mapconcat #'identity headline " "))))
+
+          ;; update props and description
+          (let ((entry-end (org-entry-end-position))
+                (entry-outline-level (org-outline-level)))
+
+            (save-restriction
+              (org-narrow-to-element)
+              (forward-line)
+              (re-search-forward "^ *[^: ]" entry-end)
+              (delete-region (point) entry-end))
+
+            (when description
+              (save-restriction
+                (narrow-to-region (point) (point))
+                (insert description "\n")
+                (indent-region (point-min) (point-max) (1+ entry-outline-level))
+                (fill-region (point-min) (point-max))))
+            (org-entry-put event-pos "DT" (ical-event:org-timestamp event))
+            (org-entry-put event-pos "ORGANIZER" organizer)
+            (org-entry-put event-pos "LOCATION" location)
+            (org-entry-put event-pos "RRULE" recur)
+            (when reply-status (org-entry-put event-pos "REPLY"
+                                              (capitalize (symbol-name reply-status))))
+            (save-buffer)))))))
+
+(defun mail-calendar--cancel-org-event (event org-file)
+  (with-current-buffer (find-file-noselect org-file)
+    (let ((event-pos (org-find-entry-with-id (ical-event:uid event))))
+      (when event-pos
+        (let ((ts (org-entry-get event-pos "DT")))
+          (when ts
+            (org-entry-put event-pos "DT" (mail-calendar--deactivate-org-timestamp ts))
+            (save-buffer)))))))
+
+(defun mail-calendar--get-org-event-reply-status (event org-file)
+  (let ((id (ical-event:uid event)))
+    (when (mail-calendar-org-event-exists-p id org-file)
+        (save-excursion
+          (with-current-buffer (find-file-noselect org-file)
+            (let ((event-pos (org-find-entry-with-id id)))
+              (org-entry-get event-pos "REPLY")))))))
+
+(defun mail-calendar-org-event-exists-p (id org-file)
+  "Return t when given event ID exists in ORG-FILE."
+  (save-excursion
+    (with-current-buffer (find-file-noselect org-file)
+      (let ((event-pos (org-find-entry-with-id id)))
+        (when event-pos
+          (string= (cdr (assoc "ICAL_EVENT" (org-entry-properties event-pos)))
+                   "t"))))))
+
+
+(defun mail-calendar-insinuate-org-templates ()
+  (unless (cl-find-if (lambda (x) (string= (second x) mail-calendar-org-template-name))
+                      org-capture-templates)
+    (setq org-capture-templates
+          (append `((,mail-calendar-org-template-key
+                     ,mail-calendar-org-template-name
+                     entry
+                     (file+olp ,mail-calendar-org-capture-file ,@mail-calendar-org-capture-headline)
+                     "%i"
+                     :immediate-finish t))
+                  org-capture-templates))
+
+    ;; hide the template from interactive template selection list
+    ;; (org-capture)
+    ;; NOTE: doesn't work when capturing from string
+    ;; (when (boundp 'org-capture-templates-contexts)
+    ;;   (push `(,mail-calendar-org-template-key "" ((in-mode . "gnus-article-mode")))
+    ;;         org-capture-templates-contexts))
+    ))
+
+(defun mail-calendar:org-event-save (event reply-status)
+  (with-temp-buffer
+    (org-capture-string (ical-event->org-entry event reply-status)
+                        mail-calendar-org-template-key)))
+
+(defun mail-calendar:org-event-update (event reply-status)
+  (mail-calendar--update-org-event event mail-calendar-org-capture-file reply-status))
+
+(defun mail-calendar:org-event-cancel (event)
+  (mail-calendar--cancel-org-event event mail-calendar-org-capture-file))
+
+(defun mail-calendar:org-entry-exists-p (event)
+  (mail-calendar-org-event-exists-p (ical-event:uid event)
+                                    mail-calendar-org-capture-file))
+
+(defun mail-calendar-show-org-entry (event)
+  (mail-calendar--show-org-event event mail-calendar-org-capture-file))
+
+(defun mail-calendar-show-org-agenda (event)
+  (let* ((time-delta (time-subtract (ical-event:end-time event)
+                                    (ical-event:start-time event)))
+         (duration-days (1+ (/ (+ (* (first time-delta) (expt 2 16))
+                                  (second time-delta))
+                               86400))))
+
+    (org-agenda-list nil (ical-event:start event) duration-days)))
+
+(defun mail-calendar:org-event-reply-status (event)
+  (mail-calendar--get-org-event-reply-status event mail-calendar-org-capture-file))
+
+(defmethod cal-event:sync-to-org ((event ical-event-request) reply-status)
+  (if (mail-calendar-org-event-exists-p (ical-event:uid event) mail-calendar-org-capture-file)
+      (mail-calendar:org-event-update event reply-status)
+    (mail-calendar:org-event-save event reply-status)))
+
+(defmethod cal-event:sync-to-org ((event ical-event-cancel))
+  (when (mail-calendar-org-event-exists-p
+         (ical-event:uid event) mail-calendar-org-capture-file)
+    (mail-calendar:org-event-cancel event)))
+
+(defun mail-calendar-org-setup ()
+  (if (and mail-calendar-org-capture-file mail-calendar-org-capture-headline)
+      (progn
+        (mail-calendar-insinuate-org-templates)
+        (setq mail-calendar-org-enabled-p t))
+    (message "Cannot enable Calendar->Org: missing capture file, headline")))
+
+(provide 'mail-calendar-org)
+;;; mail-calendar-org.el ends here
