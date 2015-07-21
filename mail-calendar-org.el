@@ -265,6 +265,7 @@ Return nil for non-recurring EVENT."
     (mail-calendar:org-event-cancel event)))
 
 (defun mail-calendar-org-setup ()
+  (message "Initializing mail-calendar setup")
   (if (and mail-calendar-org-capture-file mail-calendar-org-capture-headline)
       (progn
         (mail-calendar-insinuate-org-templates)

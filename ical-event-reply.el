@@ -20,7 +20,7 @@
 
 ;;; Commentary:
 
-;; 
+;;
 
 ;;; Code:
 
@@ -61,6 +61,7 @@
                         (push new-line reply-event-lines))))))
 
       (mapc #'process-event-line (split-string event "\n"))
+      (debug)
 
       (unless (cl-find-if (lambda (x) (string-match "^ATTENDEE" x))
                           reply-event-lines)

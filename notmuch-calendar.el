@@ -55,8 +55,7 @@
 (defvar notmuch-calendar-identities
   (cl-mapcan (lambda (x) (if (listp x) x (list x)))
              (list user-full-name (regexp-quote user-mail-address)
-                   ; NOTE: this one can be a list
-                   ; NOTE: this variable works even if you don't use gnus
+                   "stuohy@internews.org"
                    gnus-ignored-from-addresses)))
 
 ;; TODO: make the template customizable
@@ -82,150 +81,74 @@
        "\n"
        description))))
 
-(defmacro with-decoded-handle (handle &rest body)
-  "Execute BODY in buffer containing the decoded contents of HANDLE."
-  (let ((charset (make-symbol "charset")))
-    `(let ((,charset (cdr (assoc 'charset (mm-handle-type ,handle)))))
-       (with-temp-buffer
-         (mm-insert-part ,handle)
-         (when (string= ,charset "utf-8")
-           (mm-decode-coding-region (point-min) (point-max) 'utf-8))
-
-         ,@body))))
-
-
-(defun ical-event-from-handle (handle &optional attendee-name-or-email)
-  (with-decoded-handle handle
-      (ical-event-from-buffer (current-buffer) attendee-name-or-email)))
-
-(defun notmuch-calendar-send-buffer-by-mail (buffer-name subject id)
-  "TODO Write function documentation here"
-  (let ((message-signature nil))
-    (with-temp-buffer
-      ;; Open the message with the corresponding ID
-      (notmuch-show id nil (current-buffer) id "*ICAL-REPLY*")
-      ;; Create a reply message
-      (notmuch-show-reply)
-      (message-goto-body)
-      (mml-insert-multipart "alternative")
-      (mml-insert-empty-tag 'part 'type "text/html")
-      (mml-attach-buffer buffer-name "text/calendar; method=REPLY; charset=UTF-8")
-      (message-goto-subject)
-      (delete-region (line-beginning-position) (line-end-position))
-      (insert "Subject: " subject)
-      (message-send-and-exit)
-      ;; Kill the email message buffer
-      (notmuch-bury-or-kill-this-buffer))))
-
-(defun notmuch-calendar-reply (data)
-  (let* ((handle (first data))
-         (status (second data))
-         (event (third data))
-         (message-id (notmuch-show-get-message-id))
-         (reply (with-decoded-handle handle
-                   (ical-event-reply-from-buffer (current-buffer)
-                                                 status notmuch-calendar-identities))))
-
-    (when reply
-      (cl-flet ((fold-icalendar-buffer ()
-                  (goto-char (point-min))
-                  (while (re-search-forward "^\\(.\\{72\\}\\)\\(.+\\)$" nil t)
-                    (replace-match "\\1\n \\2")
-                    (goto-char (line-beginning-position)))))
-        (let ((subject (concat (capitalize (symbol-name status))
-                               ": " (ical-event:summary event))))
-
-          (with-current-buffer (get-buffer-create notmuch-calendar-reply-bufname)
-            (delete-region (point-min) (point-max))
-            (insert reply)
-            (fold-icalendar-buffer)
-            (notmuch-calendar-send-buffer-by-mail (buffer-name) subject message-id))
-
-          ;; Back in article buffer
-          (setq-local notmuch-calendar-reply-status status)
-          (when mail-calendar-org-enabled-p
-            (notmuch-calendar:org-event-update event status)
-            ;; refresh message buffer to update the reply status
-            (with-current-buffer (current-buffer)
-              (notmuch-show-refresh-view))))))))
-
 (defun notmuch-calendar-sync-event-to-org (event)
   (cal-event:sync-to-org event notmuch-calendar-reply-status))
 
 (defun notmuch-show-insert-part-text/calendar (msg part content-type nth depth button)
-  "Modified from notmuch-show.el"
-  (insert (with-temp-buffer
-            (insert (notmuch-get-bodypart-text msg part notmuch-show-process-crypto))
-            ;; Insert calendaring functionality buttons
-            (notmuch-calendar-mm-inline)
-            ;; notmuch-get-bodypart-text does no newline conversion.
-            ;; Replace CRLF with LF before icalendar can use it.
-            (goto-char (point-min))
-            (while (re-search-forward "\r\n" nil t)
-              (replace-match "\n" nil nil))
-            (let ((file (make-temp-file "notmuch-ical"))
-                  result)
-              (unwind-protect
-                  (progn
-                    (unless (icalendar-import-buffer file t)
-                      (error "Icalendar import error. See *icalendar-errors* for more information"))
-                    (set-buffer (get-file-buffer file))
-                    (setq result (buffer-substring (point-min) (point-max)))
-                    (set-buffer-modified-p nil)
-                    (kill-buffer (current-buffer)))
-                (delete-file file))
-              result)))
+  ;; Create buffer
+  (let ((event)
+        (handle msg))
+    (insert (with-temp-buffer
+              ;; get ical event from message
+              (with-temp-buffer
+                ;; Add message in it
+                (insert (notmuch-get-bodypart-text msg part notmuch-show-process-crypto))
+                ;; notmuch-get-bodypart-text does no newline conversion.
+                ;; Replace CRLF with LF before icalendar can use it.
+                (goto-char (point-min))
+                (while (re-search-forward "\r?\n" nil t)
+                  (replace-match "\n" nil nil))
+                (setq event (ical-event-from-buffer (current-buffer) notmuch-calendar-identities)))
+              (setq notmuch-calendar-event event)
+              (let ((reply-status "Not replied yet")
+                    reply-buttons
+                    org-buttons)
+                (setq notmuch-calendar-reply-status nil)
+                ;; Check if RSVP'ed and set that
+                (when event
+                  (when mail-calendar-org-enabled-p
+                    (let* ((org-entry-exists-p (mail-calendar:org-entry-exists-p event))
+                           (export-button-text (if org-entry-exists-p "Update Org Entry" "Export to Org")))
+
+                      ;; Create buttons related to ORG
+                      (setq org-buttons (append org-buttons
+                                                `(("Show Agenda" mail-calendar-show-org-agenda ,event))))
+
+                      ;;Add either "export" or "show" button
+                      (when (ical-event-request-p event)
+                        (setq org-buttons (append org-buttons
+                                                  `((,export-button-text notmuch-calendar-sync-event-to-org ,event)))))
+                      (when org-entry-exists-p
+                        (setq org-buttons (append org-buttons
+                                                  `(("Show Org Entry" mail-calendar-show-org-entry ,event)))))))
+
+                  ;; insert button groups into the buffer
+                  (notmuch-calendar-insert-button-group org-buttons))
+                ;; insert the status of the current event
+                (insert (ical-event->notmuch-calendar event reply-status))
+                (setq result (buffer-substring (point-min) (point-max)))
+                ;; (end insert function) to insert button text into original buffer
+                result))))
   t)
 
+(defun notmuch-calendar-insert-button-group (buttons)
+  (when buttons
+    (mapc (lambda (x)
+            (apply 'notmuch-calendar-insert-text-button x)
+            (insert "    "))
+          buttons)
+    (insert "\n\n")))
 
-(defun notmuch-calendar-mm-inline (handle)
-  (let ((event (ical-event-from-handle handle notmuch-calendar-identities))
-        (reply-status "Not replied yet")
-        reply-buttons
-        org-buttons)
-
-    (setq notmuch-calendar-reply-status nil)
-
-    (when event
-      (when (and (not (ical-event-reply-p event))
-                 (ical-event:rsvp event))
-        (when mail-calendar-org-enabled-p
-          (setq reply-status (or (notmuch-calendar:org-event-reply-status event)
-                                 reply-status)))
-
-        (setq reply-buttons
-              `(("Accept" notmuch-calendar-reply (,handle accepted ,event ))
-                ("Tentative" notmuch-calendar-reply (,handle tentative ,event ))
-                ("Decline" notmuch-calendar-reply (,handle declined ,event )))))
-
-      (when mail-calendar-org-enabled-p
-        (let* ((org-entry-exists-p (notmuch-calendar:org-entry-exists-p event))
-               (export-button-text (if org-entry-exists-p "Update Org Entry" "Export to Org")))
-
-          (setq org-buttons (append org-buttons
-                                `(("Show Agenda" notmuch-calendar-show-org-agenda ,event))))
-
-          (when (ical-event-request-p event)
-            (setq org-buttons (append org-buttons
-                                  `((,export-button-text notmuch-calendar-sync-event-to-org ,event)))))
-          (when org-entry-exists-p
-            (setq org-buttons (append org-buttons
-                                  `(("Show Org Entry" notmuch-calendar-show-org-entry ,event)))))))
-
-      (cl-flet ((insert-button-group (buttons)
-                  (when buttons
-                    (mapc (lambda (x)
-                            (apply 'notmuch-calendar-insert-button x)
-                            (insert "    "))
-                          buttons)
-                    (insert "\n\n"))))
-
-        (insert-button-group reply-buttons)
-        (insert-button-group org-buttons))
-
-      (setq notmuch-calendar-event event
-            notmuch-calendar-handle handle)
-      (insert (ical-event->notmuch-calendar event reply-status)))))
+(defun notmuch-calendar-insert-text-button (label button-action &optional args)
+   (if args
+       (insert-text-button label
+                           :type 'notmuch-button-type
+                           'action `(lambda (args)
+                                      (,button-action ,args)))
+     (insert-text-button label
+                         :type 'notmuch-button-type
+                         'action `(lambda (args)
+                                    (,button-action)))))
 
 (defun notmuch-calendar-save-part (handle)
   (let (event)
@@ -242,27 +165,6 @@
     (when data
       (notmuch-calendar-save-part data))))
 
-(defun notmuch-calendar-reply-accept ()
-  "Accept invitation in the current article."
-  (interactive)
-  (with-current-buffer (current-buffer)
-    (notmuch-calendar-reply (list notmuch-calendar-handle 'accepted notmuch-calendar-event))
-    (setq-local notmuch-calendar-reply-status 'accepted)))
-
-(defun notmuch-calendar-reply-tentative ()
-  "Send tentative response to invitation in the current article."
-  (interactive)
-  (with-current-buffer (current-buffer)
-    (notmuch-calendar-reply (list notmuch-calendar-handle 'tentative notmuch-calendar-event))
-    (setq-local notmuch-calendar-reply-status 'tentative)))
-
-(defun notmuch-calendar-reply-decline ()
-  "Decline invitation in the current article."
-  (interactive)
-  (with-current-buffer (current-buffer)
-    (notmuch-calendar-reply (list notmuch-calendar-handle 'declined notmuch-calendar-event))
-    (setq-local notmuch-calendar-reply-status 'declined)))
-
 (defun notmuch-calendar-event-export ()
   "Export calendar event to `org-mode', or update existing agenda entry."
   (interactive)
@@ -276,32 +178,33 @@
 (defun notmuch-calendar-event-show ()
   "Display `org-mode' agenda entry related to the calendar event."
   (interactive)
-  (notmuch-calendar-show-org-entry
+  (mail-calendar-show-org-entry
    (with-current-buffer (current-buffer)
      notmuch-calendar-event)))
 
 (defun notmuch-calendar-event-check-agenda ()
   "Display `org-mode' agenda for days between event start and end dates."
   (interactive)
-  (notmuch-calendar-show-org-agenda
+  (mail-calendar-show-org-agenda
    (with-current-buffer (current-buffer)
      notmuch-calendar-event)))
 
+;; Still need to define this
+;; (defvar notmuch-calendar-part-map
+;;   (let ((map (make-sparse-keymap)))
+;;     (define-key map "a" 'notmuch-calendar-reply-accept)
+;;     (define-key map "t" 'notmuch-calendar-reply-tentative)
+;;     (define-key map "d" 'notmuch-calendar-reply-decline)
+;;     (define-key map "c" 'notmuch-calendar-event-check-agenda)
+;;     (define-key map "e" 'notmuch-calendar-event-export)
+;;     (define-key map "s" 'notmuch-calendar-event-show)
+;;   map)
+;;   "Submap for part commands")
 
-(defvar notmuch-calendar-part-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map "a" notmuch-calendar-reply-accept)
-    (define-key map "t" notmuch-calendar-reply-tentative)
-    (define-key map "d" notmuch-calendar-reply-decline)
-    (define-key map "c" notmuch-calendar-event-check-agenda)
-    (define-key map "e" notmuch-calendar-event-export)
-    (define-key map "s" notmuch-calendar-event-show))
-    map)
-  "Submap for part commands")
-(fset 'notmuch-show-part-map notmuch-show-part-map)
+;; (fset 'notmuch-calendar-part-map notmuch-calendar-part-map)
 
-;; Add a key "i" to the notmuch show mode map which opens the calendar map
-(define-key notmuch-show-mode-map "i" 'notmuch-calendar-part-map)
+;; ;; Add a key "i" to the notmuch show mode map which opens the calendar map
+;; (define-key notmuch-show-mode-map "I" 'notmuch-calendar-part-map)
 
 (provide 'notmuch-calendar)
 ;;; notmuch-calendar.el ends here
